@@ -4,3 +4,7 @@ dist/
 *.txt
 *.pt
 ac_solver/agents/checkpoints/
+__pycache__/
+.DS_Store
+results/
+scripts/

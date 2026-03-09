@@ -8,6 +8,7 @@ python breadth_first.py
 
 import numpy as np
 from collections import deque
+from tqdm import tqdm
 from ac_solver.envs.utils import is_array_valid_presentation, is_presentation_trivial
 from ac_solver.envs.ac_moves import ACMove
 
@@ -17,6 +18,8 @@ def bfs(
     max_nodes_to_explore=10000,
     verbose=False,
     cyclically_reduce_after_moves=False,
+    use_fixed_lengths=True,
+    show_progress=True,
 ):
     """
     Performs a breadth-first search on an AC graph starting from the given presentation.
@@ -28,9 +31,10 @@ def bfs(
         cyclically_reduce_after_moves (bool, optional): Apply cyclic reduction after each move (default: False).
 
     Returns:
-        tuple: (is_search_successful, path)
+        tuple: (is_search_successful, path, visited_nodes)
             - is_search_successful (bool): Whether a trivial state was found.
             - path (list of tuple): Sequence of (action, presentation_length).
+            - visited_nodes (int): Number of unique states explored.
     """
 
     assert is_array_valid_presentation(
@@ -58,13 +62,22 @@ def bfs(
     to_explore = deque([(state_tup, init_path)])  #
     min_length = sum(word_lengths)
 
+    pbar = tqdm(total=max_nodes_to_explore, desc="Searching", unit=" nodes", disable=not show_progress)
+
     while to_explore:
         state_tuple, path = to_explore.popleft()
         state = np.array(state_tuple, dtype=np.int8)  # convert tuple to state
-        word_lengths = [
-            np.count_nonzero(presentation[:max_relator_length]),
-            np.count_nonzero(presentation[max_relator_length:]),
-        ]
+        if use_fixed_lengths:
+            word_lengths = [
+                np.count_nonzero(state[:max_relator_length]),
+                np.count_nonzero(state[max_relator_length:]),
+            ]
+        else:
+            # Legacy behavior (bug): uses original presentation instead of current state
+            word_lengths = [
+                np.count_nonzero(presentation[:max_relator_length]),
+                np.count_nonzero(presentation[max_relator_length:]),
+            ]
 
         for action in range(0, 12):
             new_state, new_word_lengths = ACMove(
@@ -79,48 +92,43 @@ def bfs(
             if new_length < min_length:
                 min_length = new_length
                 if verbose:
-                    print(f"New minimal length found: {min_length}")
+                    tqdm.write(f"New minimal length found: {min_length}")
 
             if new_length == 2:
-                return True, path + [(action, new_length)]
+                pbar.update(len(tree_nodes) - pbar.n)
+                pbar.close()
+                return True, path + [(action, new_length)], len(tree_nodes)
 
             if state_tup not in tree_nodes:
                 tree_nodes.add(state_tup)
                 to_explore.append((state_tup, path + [(action, new_length)]))
+                pbar.update(1)
 
         if len(tree_nodes) >= max_nodes_to_explore:
+            pbar.close()
             print(
                 f"Exiting search as number of explored nodes = {len(tree_nodes)} has exceeded the limit {max_nodes_to_explore}"
             )
             break
 
-    return False, None
+    pbar.close()
+    return False, None, len(tree_nodes)
 
 
 if __name__ == "__main__":
+    from ac_solver.search.cli_utils import parse_args, load_presentation, print_path
 
-    presentation = np.array([1, 1, -2, -2, -2, 0, 0, 1, 2, 1, -2, -1, -2, 0])  # AK(2)
+    args = parse_args(description="Run BFS on an AC presentation")
+    presentation = load_presentation(args)
 
-    ans, path = bfs(presentation=presentation, max_nodes_to_explore=int(1e6))
+    ans, path, _ = bfs(
+        presentation=presentation,
+        max_nodes_to_explore=args.max_nodes,
+        verbose=True,
+        cyclically_reduce_after_moves=args.cyclic_reduce,
+    )
 
-    if path:
-        print(
-            f"""
-              Presentation {presentation} solved!
-              Path length: {len(path)}
-              """
-        )
-        print("Checking whether this path actually leads to a trivial state..")
-        word_lengths = [5, 6]
-
-        for action, _ in path[1:]:
-            presentation, word_lengths = ACMove(
-                move_id=action,
-                presentation=presentation,
-                max_relator_length=7,
-                lengths=word_lengths,
-                cyclical=False,
-            )
-
-        print(f"Final state achieved: {presentation}")
-        print(f"Is trivial? {is_presentation_trivial(presentation)}")
+    if ans and path:
+        print_path(presentation, path)
+    else:
+        print(f"\nFailed to solve presentation {presentation}.")

@@ -3,12 +3,65 @@
 """
 
 import argparse
+import sys
 from distutils.util import strtobool
 from os.path import basename
 
 
+PAPER_PRESET = {
+    "horizon_length": 200,
+    "num_envs": 28,               # paper: 28 parallel actors
+    "num_steps": 200,
+    "total_timesteps": 100_000_000,
+    "learning_rate": 1e-4,        # paper: 1e-4 with linear decay to 0
+    "gamma": 0.999,               # paper: 0.999
+    "gae_lambda": 0.95,
+    "update_epochs": 1,           # paper: 1
+    "num_minibatches": 4,
+    "clip_coef": 0.2,
+    "ent_coef": 0.01,
+    "vf_coef": 0.5,
+    "max_grad_norm": 0.5,
+    "clip_rewards": True,
+    "min_rew": -10,
+    "max_rew": 1000,
+    "anneal_lr": True,
+    "lr_decay": "linear",
+    "nodes_counts": [512, 512],   # paper: 2-layer MLP with 512 hidden units
+    "repeat_solved_prob": 0.25,
+    "states_type": "all",
+    "fixed_init_state": False,
+}
+
+MAC_PRESET = {
+    **PAPER_PRESET,
+    "num_envs": 8,
+    "total_timesteps": 10_000_000,
+    "device": "auto",
+}
+
+PRESETS = {
+    "paper": PAPER_PRESET,
+    "mac": MAC_PRESET,
+}
+
+
 def parse_args():
+    # First pass: extract --preset to know which defaults to apply
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--preset", type=str, default=None, choices=["paper", "mac"])
+    pre_args, _ = pre_parser.parse_known_args()
+
+    preset_defaults = PRESETS.get(pre_args.preset, {}) if pre_args.preset else {}
+
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        choices=["paper", "mac"],
+        help="Named preset: 'paper' (Appendix A defaults), 'mac' (smaller parallelism for Mac)",
+    )
     parser.add_argument(
         "--exp-name",
         type=str,
@@ -33,6 +86,12 @@ def parse_args():
         help="if toggled, cuda will be enabled by default",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        help="Device: 'auto' (mps if available, else cpu), 'cpu', 'mps', 'cuda'",
+    )
+    parser.add_argument(
         "--wandb-log",
         type=lambda x: bool(strtobool(x)),
         default=False,
@@ -52,6 +111,40 @@ def parse_args():
         default=None,
         help="the entity (team) of wandb's project",
     )
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        default="offline",
+        choices=["online", "offline", "disabled"],
+        help="W&B logging mode (default: offline)",
+    )
+
+    # Checkpoint / resume arguments
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint .pt file to resume training from",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=str,
+        default=None,
+        help="Directory for checkpoints (default: out/<run_name>)",
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=100,
+        help="Save checkpoint every N updates (default: 100)",
+    )
+    parser.add_argument(
+        "--eval-at",
+        nargs="+",
+        type=int,
+        default=[100_000, 500_000, 1_000_000, 5_000_000, 10_000_000],
+        help="Save named checkpoints at these global_step values for post-hoc evaluation",
+    )
 
     # Environment specific arguments
     parser.add_argument(
@@ -60,8 +153,8 @@ def parse_args():
         default=False,
         nargs="?",
         const=True,
-        help="""each rollout may either start from the same fixed state or from one of many possible states. 
-            If False (default), I use a files containing presentations of Miller-Schupp series. 
+        help="""each rollout may either start from the same fixed state or from one of many possible states.
+            If False (default), I use a files containing presentations of Miller-Schupp series.
             Which file is chosen is determined by states-type arg (see below).
             If True, the presentation is specified by relator1, relator2 and max-length.""",
     )
@@ -278,6 +371,10 @@ def parse_args():
         default=0.00001,
         help="epsilon hyperparameter for PyTorch Adam Optimizer",
     )
+
+    # Apply preset defaults before parsing (CLI args override preset values)
+    if preset_defaults:
+        parser.set_defaults(**preset_defaults)
 
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)

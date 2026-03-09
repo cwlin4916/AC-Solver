@@ -5,7 +5,6 @@ ppo_training_loop function implements the training loop logic of PPO.
 import math
 import random
 import uuid
-import wandb
 from collections import deque
 from tqdm import tqdm
 from os import makedirs
@@ -65,6 +64,36 @@ def get_curr_lr(n_update, lr_decay, warmup, max_lr, min_lr, total_updates):
     return lrnow
 
 
+def _build_checkpoint(agent, optimizer, args, update, episode, global_step,
+                      normalized_returns, success_record, v_loss, pg_loss,
+                      entropy_loss, approx_kl, explained_var, clipfracs,
+                      round1_complete, curr_states, states_processed,
+                      ACMoves_hist, envs):
+    """Build a checkpoint dict with all training state."""
+    return {
+        "critic": agent.critic.state_dict(),
+        "actor": agent.actor.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "update": update,
+        "episode": episode,
+        "config": vars(args),
+        "mean_return": normalized_returns.mean(),
+        "success_record": success_record,
+        "value_loss": v_loss.item(),
+        "policy_loss": pg_loss.item(),
+        "entropy_loss": entropy_loss.item(),
+        "approx_kl": approx_kl.item(),
+        "explained_var": explained_var,
+        "clipfrac": np.mean(clipfracs),
+        "global_step": global_step,
+        "round1_complete": round1_complete,
+        "curr_states": curr_states,
+        "states_processed": states_processed,
+        "ACMoves_hist": ACMoves_hist,
+        "supermoves": getattr(envs.envs[0], "supermoves", None),
+    }
+
+
 def ppo_training_loop(
     envs,
     args,
@@ -76,6 +105,8 @@ def ppo_training_loop(
     ACMoves_hist,
     states_processed,
     initial_states,
+    start_update=1,
+    resumed_state=None,
 ):
     obs = torch.zeros(
         (args.num_steps, args.num_envs) + envs.single_observation_space.shape
@@ -88,32 +119,52 @@ def ppo_training_loop(
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
-    global_step = 0
     next_obs = torch.Tensor(envs.reset()[0]).to(device)  # get first observation
     next_done = torch.zeros(args.num_envs).to(device)  # get first done
     num_updates = args.total_timesteps // args.batch_size
     episodic_return = np.array([0] * args.num_envs)
     episodic_length = np.array([0] * args.num_envs)
-    episode = 0
     returns_queue = deque([0], maxlen=100)
     lengths_queue = deque([0], maxlen=100)
-    round1_complete = False  # whether we have already chosen each element of initial_states at least once to initiate rollout
     beta = None if args.is_loss_clip else args.beta
 
+    # Restore state from checkpoint if resuming
+    if resumed_state:
+        global_step = resumed_state["global_step"]
+        episode = resumed_state["episode"]
+        round1_complete = resumed_state["round1_complete"]
+        success_record.update(resumed_state["success_record"])
+        ACMoves_hist.update(resumed_state["ACMoves_hist"])
+        curr_states[:] = resumed_state["curr_states"]
+        states_processed.update(resumed_state["states_processed"])
+    else:
+        global_step = 0
+        episode = 0
+        round1_complete = False
+
+    # Checkpoint directory
     run_name = f"{args.exp_name}_ppo-ffn-nodes_{args.nodes_counts}_{uuid.uuid4()}"
-    out_dir = f"out/{run_name}"
+    out_dir = args.checkpoint_dir if args.checkpoint_dir else f"out/{run_name}"
     makedirs(out_dir, exist_ok=True)
+
+    # Sort eval thresholds for boundary checking
+    eval_thresholds = sorted(args.eval_at) if args.eval_at else []
+
     if args.wandb_log:
+        import wandb
         run = wandb.init(
             project=args.wandb_project_name,
             name=run_name,
             config=vars(args),
             save_code=True,
+            mode=args.wandb_mode,
         )
 
     print(f"total number of timesteps: {args.total_timesteps}, updates: {num_updates}")
+    print(f"starting from update {start_update}, checkpoint dir: {out_dir}")
     for update in tqdm(
-        range(1, num_updates + 1), desc="Training Progress", total=num_updates
+        range(start_update, num_updates + 1), desc="Training Progress",
+        total=num_updates - start_update + 1,
     ):
 
         # using different seed for each update to ensure reproducibility of paused-and-resumed runs
@@ -137,6 +188,7 @@ def ppo_training_loop(
         for step in tqdm(
             range(0, args.num_steps), desc=f"Rollout Phase - {update}", leave=False
         ):
+            prev_global_step = global_step
             global_step += 1 * args.num_envs
             obs[step] = next_obs
             dones[step] = next_done  # contains 1 if done else 0
@@ -155,7 +207,7 @@ def ppo_training_loop(
                 action.cpu().numpy()
             )  # step is taken on cpu
             rewards[step] = (
-                torch.tensor(reward).to(device).view(-1)
+                torch.tensor(reward, dtype=torch.float32).to(device).view(-1)
             )  # r_0 is the reward from taking a_0 in s_0
             episodic_return = episodic_return + reward
             episodic_length = episodic_length + 1
@@ -229,9 +281,13 @@ def ppo_training_loop(
 
         if (
             not args.norm_rewards
-        ):  # if not normalizing rewards through a NormalizeRewards Wrapper, rescale rewards manually.
-            rewards /= envs.envs[0].max_reward
-            normalized_returns = np.array(returns_queue) / envs.envs[0].max_reward
+        ):  # Rescale rewards by max_reward (= horizon * max_relator_length * 2).
+            # This constant scale factor is not in the paper. With clip_rewards=True,
+            # raw rewards are in [-10, 1000]; after division they become ~[-0.0007, 0.069].
+            # Does not change optimal policy but affects advantage/return magnitudes.
+            base_env = envs.envs[0].unwrapped if hasattr(envs.envs[0], 'unwrapped') else envs.envs[0]
+            rewards /= base_env.max_reward
+            normalized_returns = np.array(returns_queue) / base_env.max_reward
             normalized_lengths = np.array(lengths_queue) / args.horizon_length
         else:
             normalized_returns = np.array(returns_queue)
@@ -356,6 +412,7 @@ def ppo_training_loop(
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         if args.wandb_log:
+            import wandb
             wandb.log(
                 {
                     "charts/global_step": global_step,
@@ -381,30 +438,30 @@ def ppo_training_loop(
                 }
             )
 
-        if update > 0 and update % 100 == 0:  # save a checkpoint every 100 updates
-            checkpoint = {
-                "critic": agent.critic.state_dict(),
-                "actor": agent.actor.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "update": update,
-                "episode": episode,
-                "config": vars(args),
-                "mean_return": normalized_returns.mean(),
-                "success_record": success_record,
-                "value_loss": v_loss.item(),
-                "policy_loss": pg_loss.item(),
-                "entropy_loss": entropy_loss.item(),
-                "approx_kl": approx_kl.item(),
-                "explained_var": explained_var,
-                "clipfrac": np.mean(clipfracs),
-                "global_step": global_step,
-                "round1_complete": round1_complete,
-                "curr_states": curr_states,
-                "states_processed": states_processed,
-                "ACMoves_hist": ACMoves_hist,
-                "supermoves": envs.envs[0].supermoves,  # dict of supermoves or None
-            }
+        # Periodic checkpoint saving
+        if update > 0 and update % args.checkpoint_interval == 0:
+            checkpoint = _build_checkpoint(
+                agent, optimizer, args, update, episode, global_step,
+                normalized_returns, success_record, v_loss, pg_loss,
+                entropy_loss, approx_kl, explained_var, clipfracs,
+                round1_complete, curr_states, states_processed,
+                ACMoves_hist, envs,
+            )
             print(f"saving checkpoint to {out_dir}")
             torch.save(checkpoint, join(out_dir, "ckpt.pt"))
+
+        # Named checkpoints at eval thresholds (based on global_step)
+        for threshold in eval_thresholds:
+            if prev_global_step < threshold <= global_step:
+                checkpoint = _build_checkpoint(
+                    agent, optimizer, args, update, episode, global_step,
+                    normalized_returns, success_record, v_loss, pg_loss,
+                    entropy_loss, approx_kl, explained_var, clipfracs,
+                    round1_complete, curr_states, states_processed,
+                    ACMoves_hist, envs,
+                )
+                ckpt_path = join(out_dir, f"ckpt_{threshold}.pt")
+                print(f"saving eval checkpoint at {threshold} steps to {ckpt_path}")
+                torch.save(checkpoint, ckpt_path)
 
     return

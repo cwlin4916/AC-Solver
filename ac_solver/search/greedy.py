@@ -8,6 +8,7 @@ python greedy.py
 
 import numpy as np
 import heapq
+from tqdm import tqdm
 from ac_solver.envs.utils import is_presentation_trivial
 from ac_solver.envs.ac_moves import ACMove
 
@@ -17,6 +18,7 @@ def greedy_search(
     max_nodes_to_explore=10000,
     verbose=False,
     cyclically_reduce_after_moves=False,
+    show_progress=True,
 ):
     """
     Performs a greedy search on an AC graph starting from the given presentation.
@@ -28,9 +30,10 @@ def greedy_search(
         cyclically_reduce_after_moves (bool, optional): Apply cyclic reduction after each move (default: False).
 
     Returns:
-        tuple: (is_search_successful, path)
+        tuple: (is_search_successful, path, visited_nodes)
             - is_search_successful (bool): Whether a trivial state was found.
             - path (list of tuple): Sequence of (action, presentation_length).
+            - visited_nodes (int): Number of unique states explored.
     """
 
     presentation = np.array(
@@ -68,6 +71,8 @@ def greedy_search(
     tree_nodes.add(tuple(initial_state))
     min_length = total_initial_length
 
+    pbar = tqdm(total=max_nodes_to_explore, desc="Searching", unit=" nodes", disable=not show_progress)
+
     while to_explore:
         _, path_length, state_tuple, word_lengths, path = heapq.heappop(to_explore)
         state = np.array(state_tuple, dtype=np.int8)  # convert tuple to state
@@ -86,18 +91,12 @@ def greedy_search(
             if new_length < min_length:
                 min_length = new_length
                 if verbose:
-                    print(f"New minimal length found: {min_length}")
+                    tqdm.write(f"New minimal length found: {min_length}")
 
             if new_length == 2:
-                if verbose:
-                    print(
-                        f"Found {new_state[0:1], new_state[max_relator_length:max_relator_length+1]} after exploring {len(tree_nodes)-len(to_explore)} nodes"
-                    )
-                    print(
-                        f"Path to a trivial state: (tuples are of form (action, length of a state)) {path + [(action, new_length)]}"
-                    )
-                    print(f"Total path length: {len(path)+1}")
-                return True, path + [(action, new_length)]
+                pbar.update(len(tree_nodes) - pbar.n)
+                pbar.close()
+                return True, path + [(action, new_length)], len(tree_nodes)
 
             if state_tup not in tree_nodes:
                 tree_nodes.add(state_tup)
@@ -111,40 +110,33 @@ def greedy_search(
                         path + [(action, new_length)],
                     ),
                 )
+                pbar.update(1)
 
         if len(tree_nodes) >= max_nodes_to_explore:
+            pbar.close()
             print(
                 f"Exiting search as number of explored nodes = {len(tree_nodes)} has exceeded the limit {max_nodes_to_explore}"
             )
             break
 
-    return False, path + [(action, new_length)]
+    pbar.close()
+    return False, path + [(action, new_length)], len(tree_nodes)
 
 
 if __name__ == "__main__":
+    from ac_solver.search.cli_utils import parse_args, load_presentation, print_path
 
-    presentation = np.array([1, 1, -2, -2, -2, 0, 0, 1, 2, 1, -2, -1, -2, 0])  # AK(2)
+    args = parse_args(description="Run greedy search on an AC presentation")
+    presentation = load_presentation(args)
 
-    ans, path = greedy_search(presentation=presentation, max_nodes_to_explore=int(1e6))
+    ans, path, _ = greedy_search(
+        presentation=presentation,
+        max_nodes_to_explore=args.max_nodes,
+        verbose=True,
+        cyclically_reduce_after_moves=args.cyclic_reduce,
+    )
 
-    if path:
-        print(
-            f"""
-              Presentation {presentation} solved!
-              Path length: {len(path)}
-              """
-        )
-        print("Checking whether this path actually leads to a trivial state..")
-        word_lengths = [5, 6]
-
-        for action, _ in path[1:]:
-            presentation, word_lengths = ACMove(
-                move_id=action,
-                presentation=presentation,
-                max_relator_length=7,
-                lengths=word_lengths,
-                cyclical=False,
-            )
-
-        print(f"Final state achieved: {presentation}")
-        print(f"Is trivial? {is_presentation_trivial(presentation)}")
+    if ans and path:
+        print_path(presentation, path)
+    else:
+        print(f"\nFailed to solve presentation {presentation}.")

@@ -145,7 +145,7 @@ def trivialize_miller_schupp_through_search(
             )
 
             for pres in rels[n][lenw]:
-                solved, path = search_fn(
+                solved, path, _ = search_fn(
                     presentation=pres,
                     max_nodes_to_explore=max_nodes_to_explore,
                     verbose=False,
