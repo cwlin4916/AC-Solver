@@ -147,10 +147,11 @@ def run_evaluation(
     full,
     use_fixed_lengths,
     cyclic_reduce=True,
+    every_k=5,
 ):
     instances = load_tagged_dataset()
     if not full:
-        instances = load_stratified_subset(instances, every_k=5)
+        instances = load_stratified_subset(instances, every_k=every_k)
 
     print(f"Dataset: {len(instances)} instances ({'full' if full else '1/5 subset'})")
     print(f"Algorithm: {search_fn_name}, max_nodes: {max_nodes}, workers: {workers}")
@@ -245,6 +246,12 @@ def main():
         help="Run all 1190 instances (default: 1/5 stratified subset)",
     )
     parser.add_argument(
+        "--every-k",
+        type=int,
+        default=5,
+        help="Stratified sampling stride (default: 5 → 238 instances, 10 → 147)",
+    )
+    parser.add_argument(
         "--no-use-fixed-lengths",
         action="store_true",
         help="BFS only: use legacy (buggy) length computation for comparison",
@@ -268,6 +275,7 @@ def main():
         full=args.full,
         use_fixed_lengths=use_fixed_lengths,
         cyclic_reduce=cyclic_reduce,
+        every_k=args.every_k,
     )
 
 

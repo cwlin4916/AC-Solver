@@ -2,6 +2,7 @@
 ppo_training_loop function implements the training loop logic of PPO.
 """
 
+import csv
 import math
 import random
 import uuid
@@ -150,6 +151,23 @@ def ppo_training_loop(
     # Sort eval thresholds for boundary checking
     eval_thresholds = sorted(args.eval_at) if args.eval_at else []
 
+    # CSV metrics logger (always active, independent of wandb)
+    num_actions_for_csv = envs.single_action_space.n
+    metrics_fields = [
+        "update", "global_step", "learning_rate",
+        "policy_loss", "value_loss", "entropy_loss",
+        "approx_kl", "clipfrac", "explained_variance",
+        "logit_gap", "top1_prob", "noop_rate",
+        "episodes_this_update", "episodes_solved",
+        "total_solved", "total_unsolved",
+        "advantages_mean", "advantages_std",
+    ] + [f"action_{i}" for i in range(num_actions_for_csv)]
+    metrics_path = join(out_dir, "metrics.csv")
+    metrics_file = open(metrics_path, "w", newline="")
+    metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
+    metrics_writer.writeheader()
+    metrics_file.flush()
+
     if args.wandb_log:
         import wandb
         run = wandb.init(
@@ -184,6 +202,13 @@ def ppo_training_loop(
             )
             optimizer.param_groups[0]["lr"] = lrnow
 
+        # Diagnostic counters for this update
+        num_actions = envs.single_action_space.n
+        action_counts = torch.zeros(num_actions, device=device)
+        noop_count = 0
+        episodes_this_update = 0
+        episodes_solved_this_update = 0
+
         # collecting and recording data
         for step in tqdm(
             range(0, args.num_steps), desc=f"Rollout Phase - {update}", leave=False
@@ -202,10 +227,22 @@ def ppo_training_loop(
             actions[step] = action
             logprobs[step] = logprob
 
+            # Track action frequency
+            for a in action.long():
+                action_counts[a] += 1
+
             # TRY NOT TO MODIFY: execute the game and log data.
+            prev_obs_np = next_obs.cpu().numpy() if isinstance(next_obs, torch.Tensor) else next_obs.copy()
             next_obs, reward, done, truncated, infos = envs.step(
                 action.cpu().numpy()
             )  # step is taken on cpu
+
+            # Track no-ops (state unchanged after action, ignoring terminal resets)
+            for i in range(args.num_envs):
+                if not done[i] and not truncated[i]:
+                    if np.array_equal(prev_obs_np[i], next_obs[i]):
+                        noop_count += 1
+
             rewards[step] = (
                 torch.tensor(reward, dtype=torch.float32).to(device).view(-1)
             )  # r_0 is the reward from taking a_0 in s_0
@@ -229,19 +266,18 @@ def ppo_training_loop(
 
                         # also if done, record the sequence of actions in ACMoves_hist
                         if curr_states[i] not in ACMoves_hist:
-                            ACMoves_hist[curr_states[i]] = infos["final_info"][i][
-                                "actions"
-                            ]
+                            ACMoves_hist[curr_states[i]] = infos["actions"][i]
                         else:
                             prev_path_length = len(ACMoves_hist[curr_states[i]])
-                            new_path_length = len(infos["final_info"][i]["actions"])
+                            new_path_length = len(infos["actions"][i])
                             if new_path_length < prev_path_length:
-                                ACMoves_hist[curr_states[i]] = infos["final_info"][i][
-                                    "actions"
-                                ]
+                                ACMoves_hist[curr_states[i]] = infos["actions"][i]
 
                     # record+reset episode data, reset ith initial state to the next state in init_states
                     if el:
+                        episodes_this_update += 1
+                        if done[i]:
+                            episodes_solved_this_update += 1
                         # record and reset episode data
                         returns_queue.append(episodic_return[i])
                         lengths_queue.append(episodic_length[i])
@@ -279,16 +315,27 @@ def ppo_training_loop(
                 done
             ).to(device)
 
+        # Compute logit statistics for diagnostics (single batch forward pass)
+        with torch.no_grad():
+            all_logits = agent.actor(obs.reshape(-1, obs.shape[-1]))
+            sorted_logits, _ = all_logits.sort(dim=-1, descending=True)
+            logit_gap = (sorted_logits[:, 0] - sorted_logits[:, 1]).mean().item()
+            top1_prob = all_logits.softmax(dim=-1).max(dim=-1).values.mean().item()
+
         if (
             not args.norm_rewards
         ):  # Rescale rewards by max_reward (= horizon * max_relator_length * 2).
             # This constant scale factor is not in the paper. With clip_rewards=True,
             # raw rewards are in [-10, 1000]; after division they become ~[-0.0007, 0.069].
             # Does not change optimal policy but affects advantage/return magnitudes.
-            base_env = envs.envs[0].unwrapped if hasattr(envs.envs[0], 'unwrapped') else envs.envs[0]
-            rewards /= base_env.max_reward
-            normalized_returns = np.array(returns_queue) / base_env.max_reward
-            normalized_lengths = np.array(lengths_queue) / args.horizon_length
+            if not args.skip_reward_division:
+                base_env = envs.envs[0].unwrapped if hasattr(envs.envs[0], 'unwrapped') else envs.envs[0]
+                rewards /= base_env.max_reward
+                normalized_returns = np.array(returns_queue) / base_env.max_reward
+                normalized_lengths = np.array(lengths_queue) / args.horizon_length
+            else:
+                normalized_returns = np.array(returns_queue)
+                normalized_lengths = np.array(lengths_queue)
         else:
             normalized_returns = np.array(returns_queue)
             normalized_lengths = np.array(lengths_queue)
@@ -435,7 +482,46 @@ def ppo_training_loop(
                     "losses/clipfrac": np.mean(clipfracs),
                     "debug/advantages_mean": b_advantages.mean(),
                     "debug/advantages_std": b_advantages.std(),
+                    "debug/logit_gap_mean": logit_gap,
+                    "debug/top1_prob_mean": top1_prob,
+                    "debug/noop_rate": noop_count / (args.num_steps * args.num_envs),
+                    "charts/episodes_this_update": episodes_this_update,
+                    "charts/episodes_solved_this_update": episodes_solved_this_update,
+                    **{f"actions/action_{i}": action_counts[i].item() for i in range(num_actions)},
                 }
+            )
+
+        # CSV metrics (always logged)
+        metrics_writer.writerow({
+            "update": update,
+            "global_step": global_step,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "policy_loss": pg_loss.item(),
+            "value_loss": v_loss.item(),
+            "entropy_loss": entropy_loss.item(),
+            "approx_kl": approx_kl.item(),
+            "clipfrac": np.mean(clipfracs),
+            "explained_variance": explained_var,
+            "logit_gap": logit_gap,
+            "top1_prob": top1_prob,
+            "noop_rate": noop_count / (args.num_steps * args.num_envs),
+            "episodes_this_update": episodes_this_update,
+            "episodes_solved": episodes_solved_this_update,
+            "total_solved": len(success_record["solved"]),
+            "total_unsolved": len(success_record["unsolved"]),
+            "advantages_mean": b_advantages.mean().item(),
+            "advantages_std": b_advantages.std().item(),
+            **{f"action_{i}": action_counts[i].item() for i in range(num_actions)},
+        })
+        metrics_file.flush()
+
+        # Periodic diagnostic print (every 10 updates)
+        if update % 10 == 0:
+            print(
+                f"[step={global_step}] entropy={entropy_loss.item():.3f} "
+                f"clipfrac={np.mean(clipfracs):.4f} logit_gap={logit_gap:.4f} "
+                f"top1_prob={top1_prob:.4f} noop={noop_count / (args.num_steps * args.num_envs):.3f} "
+                f"solved={len(success_record['solved'])} ep_solved={episodes_solved_this_update}"
             )
 
         # Periodic checkpoint saving
@@ -464,4 +550,6 @@ def ppo_training_loop(
                 print(f"saving eval checkpoint at {threshold} steps to {ckpt_path}")
                 torch.save(checkpoint, ckpt_path)
 
+    metrics_file.close()
+    print(f"Metrics CSV saved to: {metrics_path}")
     return

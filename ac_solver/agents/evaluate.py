@@ -21,6 +21,7 @@ import time
 
 import numpy as np
 import torch
+from torch.distributions import Categorical
 from tqdm import tqdm
 
 from ac_solver.agents.ppo_agent import Agent
@@ -48,8 +49,9 @@ CSV_FIELDS = [
 ]
 
 
-def evaluate_instance(agent, device, instance, horizon, max_relator_length):
-    """Run greedy rollout on a single instance and return metrics dict."""
+def evaluate_instance(agent, device, instance, horizon, max_relator_length,
+                      stochastic=False):
+    """Run a single rollout on an instance. Greedy (argmax) or stochastic."""
     presentation = instance["presentation"]
     presentation = change_max_relator_length_of_presentation(
         presentation, max_relator_length
@@ -72,7 +74,10 @@ def evaluate_instance(agent, device, instance, horizon, max_relator_length):
         obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(device)
         with torch.no_grad():
             logits = agent.actor(obs_tensor)
-        action = logits.argmax(dim=-1).item()
+        if stochastic:
+            action = Categorical(logits=logits).sample().item()
+        else:
+            action = logits.argmax(dim=-1).item()
 
         obs, reward, done, truncated, info = env.step(action)
         path_length = step + 1
@@ -87,12 +92,13 @@ def evaluate_instance(agent, device, instance, horizon, max_relator_length):
 
     wallclock = time.time() - t_start
     length_increase = max_intermediate_length - initial_total_length
+    algorithm = "ppo_stochastic" if stochastic else "ppo"
 
     return {
         "instance_id": instance["instance_id"],
         "n": instance["n"],
         "lenw": instance["lenw"],
-        "algorithm": "ppo",
+        "algorithm": algorithm,
         "max_nodes": horizon,
         "solved": solved,
         "visited_nodes": path_length,
@@ -102,6 +108,25 @@ def evaluate_instance(agent, device, instance, horizon, max_relator_length):
         "length_increase": length_increase if solved else "",
         "wallclock_seconds": round(wallclock, 6),
     }
+
+
+def evaluate_instance_best_of_n(agent, device, instance, horizon,
+                                max_relator_length, num_rollouts, eval_seed):
+    """Run N stochastic rollouts and return the best result."""
+    best = None
+    for rollout in range(num_rollouts):
+        torch.manual_seed(eval_seed + instance["instance_id"] * num_rollouts + rollout)
+        result = evaluate_instance(
+            agent, device, instance, horizon, max_relator_length, stochastic=True
+        )
+        if best is None:
+            best = result
+        elif result["solved"] and not best["solved"]:
+            best = result
+        elif result["solved"] and best["solved"]:
+            if result["path_length"] < best["path_length"]:
+                best = result
+    return best
 
 
 def main():
@@ -128,6 +153,22 @@ def main():
         "--device", type=str, default="auto",
         help="Device: 'auto', 'cpu', 'mps', 'cuda'",
     )
+    parser.add_argument(
+        "--stochastic", action="store_true",
+        help="Use stochastic sampling instead of greedy argmax",
+    )
+    parser.add_argument(
+        "--num-rollouts", type=int, default=1,
+        help="Number of stochastic rollouts per instance, report best (requires --stochastic)",
+    )
+    parser.add_argument(
+        "--eval-seed", type=int, default=42,
+        help="RNG seed for stochastic evaluation reproducibility",
+    )
+    parser.add_argument(
+        "--every-k", type=int, default=5,
+        help="Stratified sampling stride (default: 5 → 238 instances, 10 → 147)",
+    )
     args = parser.parse_args()
 
     # Resolve device
@@ -152,7 +193,7 @@ def main():
     # Load dataset
     instances = load_tagged_dataset()
     if not args.full:
-        instances = load_stratified_subset(instances, every_k=5)
+        instances = load_stratified_subset(instances, every_k=args.every_k)
     print(f"Evaluating {len(instances)} instances")
 
     # Reconstruct agent
@@ -180,21 +221,37 @@ def main():
     # Run evaluation
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     solved_count = 0
+    mode_str = "stochastic" if args.stochastic else "deterministic"
+    if args.stochastic and args.num_rollouts > 1:
+        mode_str = f"stochastic (best-of-{args.num_rollouts})"
+    print(f"Evaluation mode: {mode_str}")
+
+    if args.stochastic:
+        torch.manual_seed(args.eval_seed)
 
     with open(args.output, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         writer.writeheader()
 
-        for inst in tqdm(instances, desc="Evaluating", unit=" instances"):
-            result = evaluate_instance(
-                agent, device, inst, args.horizon, max_relator_length
-            )
+        for inst in tqdm(instances, desc=f"Evaluating ({mode_str})", unit=" instances"):
+            if args.stochastic and args.num_rollouts > 1:
+                result = evaluate_instance_best_of_n(
+                    agent, device, inst, args.horizon, max_relator_length,
+                    args.num_rollouts, args.eval_seed,
+                )
+            else:
+                if args.stochastic:
+                    torch.manual_seed(args.eval_seed + inst["instance_id"])
+                result = evaluate_instance(
+                    agent, device, inst, args.horizon, max_relator_length,
+                    stochastic=args.stochastic,
+                )
             writer.writerow(result)
             f.flush()
             if result["solved"]:
                 solved_count += 1
 
-    print(f"\nResults: {solved_count}/{len(instances)} solved")
+    print(f"\nResults: {solved_count}/{len(instances)} solved ({mode_str})")
     print(f"CSV written to: {args.output}")
 
     # Print summary

@@ -5,7 +5,7 @@ import torch
 import pytest
 from unittest.mock import patch
 
-from ac_solver.agents.args import parse_args, PAPER_PRESET, MAC_PRESET, PRESETS
+from ac_solver.agents.args import parse_args, PAPER_PRESET, MAC_PRESET, PAPER_FAITHFUL_MAC, PRESETS
 from ac_solver.agents.ppo import resolve_device
 
 
@@ -48,6 +48,27 @@ class TestPresets:
         for key, value in PAPER_PRESET.items():
             if key not in ("num_envs", "total_timesteps", "device"):
                 assert MAC_PRESET[key] == value, f"mac_preset[{key}] differs from paper"
+
+    def test_paper_faithful_mac_preset(self):
+        test_args = ["script", "--preset", "paper_mac"]
+        with patch.object(sys, "argv", test_args):
+            args = parse_args()
+        assert args.total_timesteps == 100_000_000
+        assert args.num_envs == 8
+        assert args.learning_rate == 1e-4
+        assert args.gamma == 0.999
+        assert args.update_epochs == 1
+        assert args.nodes_counts == [512, 512]
+        assert args.clip_coef == 0.2
+        assert args.ent_coef == 0.01
+        assert 100_000_000 in args.eval_at
+
+    def test_paper_faithful_mac_inherits_paper(self):
+        for key, value in PAPER_PRESET.items():
+            if key not in ("num_envs", "total_timesteps", "device", "eval_at"):
+                assert PAPER_FAITHFUL_MAC[key] == value, (
+                    f"paper_faithful_mac[{key}]={PAPER_FAITHFUL_MAC[key]} differs from paper[{key}]={value}"
+                )
 
 
 class TestDeviceResolution:

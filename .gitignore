@@ -6,5 +6,11 @@ dist/
 ac_solver/agents/checkpoints/
 __pycache__/
 .DS_Store
-results/
+results/*
+!results/mini_experiment/
 scripts/
+out/
+papers/
+report/
+.claude/
+ppo_out.log

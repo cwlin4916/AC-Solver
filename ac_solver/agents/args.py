@@ -40,16 +40,25 @@ MAC_PRESET = {
     "device": "auto",
 }
 
+PAPER_FAITHFUL_MAC = {
+    **PAPER_PRESET,
+    "num_envs": 8,                  # Mac hardware: 28 → 8 parallel actors
+    "total_timesteps": 100_000_000, # Full paper budget (not truncated)
+    "device": "auto",               # MPS on Mac, CPU fallback
+    "eval_at": [1_000_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000],
+}
+
 PRESETS = {
     "paper": PAPER_PRESET,
     "mac": MAC_PRESET,
+    "paper_mac": PAPER_FAITHFUL_MAC,
 }
 
 
 def parse_args():
     # First pass: extract --preset to know which defaults to apply
     pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--preset", type=str, default=None, choices=["paper", "mac"])
+    pre_parser.add_argument("--preset", type=str, default=None, choices=["paper", "mac", "paper_mac"])
     pre_args, _ = pre_parser.parse_known_args()
 
     preset_defaults = PRESETS.get(pre_args.preset, {}) if pre_args.preset else {}
@@ -59,7 +68,7 @@ def parse_args():
         "--preset",
         type=str,
         default=None,
-        choices=["paper", "mac"],
+        choices=["paper", "mac", "paper_mac"],
         help="Named preset: 'paper' (Appendix A defaults), 'mac' (smaller parallelism for Mac)",
     )
     parser.add_argument(
@@ -370,6 +379,15 @@ def parse_args():
         type=float,
         default=0.00001,
         help="epsilon hyperparameter for PyTorch Adam Optimizer",
+    )
+    parser.add_argument(
+        "--skip-reward-division",
+        type=lambda x: bool(strtobool(x)),
+        default=False,
+        nargs="?",
+        const=True,
+        help="Skip dividing rewards by max_reward (14400). "
+             "When True, PPO sees rewards in [-10, +1000] matching the paper.",
     )
 
     # Apply preset defaults before parsing (CLI args override preset values)
