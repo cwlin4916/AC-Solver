@@ -740,12 +740,24 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
   \end{itemize}
 
   \smallskip
+  \textbf{Entropy} $H[\pi]$ measures how ``spread out'' the policy's probability distribution is:
+  \[
+    H[\pi(\cdot \mid s_t)] = -\sum_{a=1}^{12} \pi(a \mid s_t) \log \pi(a \mid s_t)
+  \]
+  \vspace{-6pt}
+  \begin{itemize}\setlength\itemsep{0pt}
+    \item $H = 0$ when the policy is deterministic (all probability on one action)
+    \item $H = \log 12 \approx 2.48$ when uniform over all 12 moves (maximum exploration)
+  \end{itemize}
+
+  \smallskip
   \textbf{Combined loss} (optimized jointly with a single Adam optimizer):
   \[
     \mathcal{L} = L^{CLIP}
     - \underbrace{c_\text{ent}}_{\scriptscriptstyle 0.01} \cdot H[\pi]
     + \underbrace{c_\text{vf}}_{\scriptscriptstyle 0.5} \cdot L^V
   \]
+  The $-c_\text{ent}\cdot H[\pi]$ term \emph{rewards} high entropy, encouraging the agent to keep exploring.
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
@@ -816,6 +828,46 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
+\begin{frame}{Worked Example: Computing $G_t$ and $V(s_t)$}
+  \small
+  \textbf{Scenario:} An AC environment episode of 5 steps, with $\gamma = 0.99$.
+
+  \medskip
+  \textbf{Rewards received:} $r_0 = -1,\; r_1 = -1,\; r_2 = -1,\; r_3 = -1,\; r_4 = +1000$ (solved at step 4).
+
+  \medskip
+  \textbf{$G_t$ (actual discounted return)} is computed \emph{backwards} from the end:
+  \begin{align*}
+    G_4 &= r_4 = +1000 \\
+    G_3 &= r_3 + \gamma G_4 = -1 + 0.99 \times 1000 = +989.0 \\
+    G_2 &= r_2 + \gamma G_3 = -1 + 0.99 \times 989.0 = +978.11 \\
+    G_1 &= r_1 + \gamma G_2 = -1 + 0.99 \times 978.11 = +967.33 \\
+    G_0 &= r_0 + \gamma G_1 = -1 + 0.99 \times 967.33 = +956.66
+  \end{align*}
+  \vspace{-10pt}
+
+  \textbf{$V(s_t)$ (critic's prediction)} is the neural network's \emph{guess} at $G_t$
+  \emph{before} the episode unfolds.  Early in training, the critic is random:
+
+  \medskip
+  \begin{center}\footnotesize
+  \begin{tabular}{lrrrl}
+    \toprule
+    $t$ & $G_t$ (actual) & $V(s_t)$ (critic) & $\hat{A}_t = G_t - V(s_t)$ & \textbf{Interpretation} \\
+    \midrule
+    0 & $+956.66$ & $+2.1$ & $+954.56$ & Action much better than expected \\
+    3 & $+989.00$ & $-0.3$ & $+989.30$ & Critic had no idea this leads to solve \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \smallskip
+  \textbf{Key:} $G_t$ uses the \emph{actual} rewards (known after rollout).
+  $V(s_t)$ is the critic's estimate (updated by training on $L^V = (V(s_t) - G_t)^2$).
+  Over time, $V(s_t) \to G_t$ and advantages shrink.
+\end{frame}
+
+% ──────────────────────────────────────────────────────────────────────────────
 \begin{frame}{Step 7: The Full PPO Training Loop}
   \small
   Putting it all together --- training alternates between \textbf{collecting data} and \textbf{updating}:
@@ -850,10 +902,38 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
   \end{tikzpicture}
   \end{center}
 
+  Each cycle around this loop is \textbf{one rollout} (= one batch of $N \!\cdot\! T$ transitions).
+  Training repeats this loop until the total step budget is exhausted.
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
-\begin{frame}{PPO Training Loop: Concrete Numbers}
+\begin{frame}{PPO Training Loop: How Many Rollouts in Our Case?}
+  \small
+  \textbf{In our case} ($N=8$ envs, $T=200$ steps, 10M total steps):
+
+  \begin{itemize}\setlength\itemsep{3pt}
+    \item Each rollout collects $8 \times 200 = 1{,}600$ transitions
+    \item Total rollouts = $\dfrac{10{,}000{,}000}{1{,}600} = \textbf{6{,}250}$ cycles around the loop
+    \item Each cycle:
+      \begin{itemize}\setlength\itemsep{1pt}
+        \item \textbf{Rollout phase:} $\sim$1.2s (run 8 envs for 200 steps each)
+        \item \textbf{GAE computation:} $\sim$0.01s (backward pass over stored rewards)
+        \item \textbf{Optimization:} $\sim$0.1s ($K{=}1$) or $\sim$0.4s ($K{=}4$)
+      \end{itemize}
+    \item Total wall-clock: $6{,}250 \times 1.6\text{s} \approx \textbf{2.8\,h}$ on Mac MPS
+  \end{itemize}
+
+  \medskip
+  \textbf{Comparison with the paper} ($N=28$, $T=200$, 100M total steps):
+  \begin{itemize}\setlength\itemsep{1pt}
+    \item Each rollout: $28 \times 200 = 5{,}600$ transitions
+    \item Total rollouts: $\frac{100{,}000{,}000}{5{,}600} = \textbf{17{,}857}$ cycles
+    \item 3$\times$ more data per rollout, 3$\times$ more rollouts, and 10$\times$ more total steps
+  \end{itemize}
+\end{frame}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\begin{frame}{PPO Training Loop: Hyperparameter Comparison}
   \small
   \textbf{Our setup vs.\ the paper:}
   \begin{center}
@@ -872,15 +952,42 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
   \end{center}
 
   \medskip
+  \textbf{Key ratio:} The paper sees each transition once per update (epochs$=$1),
+  but has $3.5\times$ more transitions per batch.
+  With epochs$=$4, our effective data per update is $1{,}600 \times 4 = 6{,}400$,
+  \emph{exceeding} the paper's 5{,}600.
+\end{frame}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\begin{frame}{PPO Training Loop: Timing Breakdown}
+  \small
   \textbf{One PPO update cycle:}
-  \begin{enumerate}\setlength\itemsep{1pt}
+  \begin{enumerate}\setlength\itemsep{4pt}
     \item \textbf{Rollout:} 8 envs $\times$ 200 steps $= 1{,}600$ transitions ($\sim$1.2s)
     \item \textbf{GAE:} compute advantages and returns ($\sim$0.01s)
     \item \textbf{Optimize:} $K$ epochs $\times$ 4 minibatches $\times$ 1 gradient step each
-      ($\sim$0.1s for $K{=}1$, $\sim$0.4s for $K{=}4$)
+      \begin{itemize}\setlength\itemsep{1pt}
+        \item $K{=}1$: $1 \times 4 = 4$ gradient steps ($\sim$0.1s)
+        \item $K{=}4$: $4 \times 4 = 16$ gradient steps ($\sim$0.4s)
+      \end{itemize}
   \end{enumerate}
-  Total: $\sim$1.3s per update ($K{=}1$) or $\sim$1.6s ($K{=}4$).
-  A 10M-step run takes $\sim$2.5--5\,h on Mac MPS.
+
+  \medskip
+  \begin{center}
+  \begin{tabular}{lrrr}
+    \toprule
+    \textbf{Run budget} & \textbf{Updates} & \textbf{Time ($K{=}1$)} & \textbf{Time ($K{=}4$)} \\
+    \midrule
+    10M steps  &  6{,}250 & $\sim$2.3\,h & $\sim$2.8\,h \\
+    50M steps  & 31{,}250 & $\sim$11\,h  & $\sim$14\,h  \\
+    100M steps & 62{,}500 & $\sim$23\,h  & $\sim$28\,h  \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \smallskip
+  \textbf{Note:} The optimization phase adds only $\sim$20\% overhead for $K{=}4$
+  because the rollout phase dominates ($\sim$75\% of wall-clock time).
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
@@ -1032,6 +1139,49 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
   \end{center}
 \end{frame}
 
+% ──────────────────────────────────────────────────────────────────────────────
+\begin{frame}{The Role of Epochs: What ``Four Passes'' Means Concretely}
+  \small
+  \textbf{Setup:} We have a batch of 1{,}600 transitions (indexed $t_1, t_2, \ldots, t_{1600}$).
+  The \textbf{minibatch count} is 4, so each minibatch has $1600 / 4 = 400$ transitions.
+
+  \medskip
+  \textbf{One ``pass'' (= one epoch):}
+  \begin{enumerate}\setlength\itemsep{1pt}
+    \item \textbf{Shuffle} the 1{,}600 transitions into a random permutation
+    \item \textbf{Split} the shuffled sequence into 4 consecutive chunks of 400:
+      \begin{center}\scriptsize
+      \begin{tabular}{llll}
+        Minibatch A: & $t_{731}, t_{42}, t_{1588}, \ldots$ & (400 transitions) & $\to$ gradient step 1 \\
+        Minibatch B: & $t_{205}, t_{1103}, t_{8}, \ldots$  & (400 transitions) & $\to$ gradient step 2 \\
+        Minibatch C: & $t_{1440}, t_{67}, t_{889}, \ldots$ & (400 transitions) & $\to$ gradient step 3 \\
+        Minibatch D: & $t_{512}, t_{1299}, t_{33}, \ldots$ & (400 transitions) & $\to$ gradient step 4 \\
+      \end{tabular}
+      \end{center}
+    \item Each minibatch computes a \textbf{separate gradient step}: forward pass $\to$ loss $\to$ backward $\to$ Adam update
+  \end{enumerate}
+
+  \medskip
+  \textbf{``Four passes'' (epochs = 4):} Repeat the above 4 times, with a
+  \emph{fresh random shuffle} each time.  Every transition appears in exactly
+  one minibatch per epoch, but in a \emph{different} minibatch each epoch.
+
+  \smallskip
+  \begin{center}\scriptsize
+  \begin{tabular}{lcccc}
+    \toprule
+    & \textbf{Epoch 1} & \textbf{Epoch 2} & \textbf{Epoch 3} & \textbf{Epoch 4} \\
+    \midrule
+    Transition $t_{42}$  & Minibatch A & Minibatch C & Minibatch B & Minibatch D \\
+    Transition $t_{205}$ & Minibatch B & Minibatch A & Minibatch D & Minibatch C \\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+
+  \textbf{Total gradient steps per update:} $4 \text{ epochs} \times 4 \text{ minibatches} = 16$ gradient steps,
+  using the same 1{,}600 transitions (but in different random groupings each time).
+\end{frame}
+
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Scaled-Down Subset}
 % ══════════════════════════════════════════════════════════════════════════════
@@ -1111,25 +1261,6 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
-\begin{frame}{The Role of $|w|$: Second Relator Complexity}
-  \small
-  While $n$ controls the first relator, $|w|$ controls the \textbf{combinatorial complexity}
-  of the second relator $r_1 = \inv{x}\, w$.
-
-  \medskip
-  \textbf{What does $|w|$ encode?}
-  \begin{itemize}\setlength\itemsep{2pt}
-    \item $w$ is a word in $\{x, \inv{x}, y, \inv{y}\}$ with \textbf{zero exponent sum on $x$}
-      (i.e., \#$x$ = \#$\inv{x}$ in $w$).
-    \item $|w| = 1$: only $w = y$ or $w = \inv{y}$ (2 choices per $n$).
-    \item $|w| = 7$: 98 distinct words after removing cyclic permutations.
-    \item Higher $|w|$ $\Rightarrow$ more ways to ``entangle'' the generators
-      $\Rightarrow$ more complex interaction between $r_0$ and $r_1$.
-  \end{itemize}
-
-\end{frame}
-
-% ──────────────────────────────────────────────────────────────────────────────
 \begin{frame}{The Role of $|w|$: Examples and Paper Observations}
   \small
   \textbf{Concrete examples} (all with $n = 2$, so $r_0 = \inv{x} y^2 x y^{-3}$):
@@ -1158,6 +1289,25 @@ pg_loss = torch.max(pg_loss1, pg_loss2).mean()
     \item For PPO, the dataset is dominated by high-$|w|$ instances:
       82\% have $|w| \ge 6$, so performance on $|w| = 6, 7$ is critical.
   \end{itemize}
+\end{frame}
+
+% ──────────────────────────────────────────────────────────────────────────────
+\begin{frame}{The Role of $|w|$: Second Relator Complexity}
+  \small
+  While $n$ controls the first relator, $|w|$ controls the \textbf{combinatorial complexity}
+  of the second relator $r_1 = \inv{x}\, w$.
+
+  \medskip
+  \textbf{What does $|w|$ encode?}
+  \begin{itemize}\setlength\itemsep{2pt}
+    \item $w$ is a word in $\{x, \inv{x}, y, \inv{y}\}$ with \textbf{zero exponent sum on $x$}
+      (i.e., \#$x$ = \#$\inv{x}$ in $w$).
+    \item $|w| = 1$: only $w = y$ or $w = \inv{y}$ (2 choices per $n$).
+    \item $|w| = 7$: 98 distinct words after removing cyclic permutations.
+    \item Higher $|w|$ $\Rightarrow$ more ways to ``entangle'' the generators
+      $\Rightarrow$ more complex interaction between $r_0$ and $r_1$.
+  \end{itemize}
+
 \end{frame}
 
 % ──────────────────────────────────────────────────────────────────────────────
